@@ -237,12 +237,26 @@ def is_c13_isotope_of_larger_peak(spec, sus_mass, sus_int):
     return spec[mask, 1].max() >= ISOTOPE_INT_RATIO * sus_int
 
 
-def find_molecular_ions(ei_df, pci_df):
+def find_molecular_ions(ei_df, pci_df, consider_mask=None):
+    """Search PCI features for molecular-ion evidence of the EI candidates.
+
+    consider_mask : optional boolean sequence aligned to ei_df's rows. When
+    given, rows where it is False are skipped entirely — the molecular-ion
+    columns (Evidence of Molecular Ion, Type of Ion, Measured Mass, Adducts
+    Found, Notes, PCI_spectrum, DeltaMass [ppm]) are left at their empty
+    defaults. This is how blank subtraction gates the search: only features
+    with abundance > 0 after blank subtraction are searched.
+    """
     ei = ei_df.copy()
 
     ei_row_ri = ei['RI'].to_numpy(dtype=float)
     ei_row_rt = ei['RT'].to_numpy(dtype=float)
     ei_mw     = ei['Molecular Weight'].to_numpy(dtype=float)
+
+    if consider_mask is None:
+        consider = np.ones(len(ei), dtype=bool)
+    else:
+        consider = np.asarray(consider_mask, dtype=bool)
 
     pci_ri = pci_df[pci_df['RI'].notna()].sort_values('RI').reset_index(drop=True)
     pci_ri_arr       = pci_ri['RI'].to_numpy()
@@ -265,6 +279,9 @@ def find_molecular_ions(ei_df, pci_df):
     fallback_count = 0
 
     for i in range(n):
+        if not consider[i]:
+            continue
+
         mw = ei_mw[i]
         if not np.isfinite(mw):
             continue
@@ -358,6 +375,7 @@ def find_molecular_ions(ei_df, pci_df):
 
     stats = {
         'candidate_rows': n,
+        'rows_searched': int(consider.sum()),
         'rows_with_evidence': int(evidence.sum()),
         'features_total': int(ei['feature_number'].nunique()),
         'features_with_evidence': int(ei.loc[evidence, 'feature_number'].nunique()),
@@ -422,6 +440,10 @@ def apply_blank_correction(df, mode, x_mult, log):
         'x_mult': x_mult,
         'messages': [],
         'applied': False,
+        # Boolean Series (aligned to df) marking rows kept after blank
+        # subtraction, i.e. abundance > 0 in at least one sample. When no
+        # correction is applied, every row is kept.
+        'passed_mask': pd.Series(True, index=df.index),
     }
 
     if mode == 'none':
@@ -493,6 +515,11 @@ def apply_blank_correction(df, mode, x_mult, log):
     appended.update(corrected_frames)
     out = pd.concat([out, pd.DataFrame(appended, index=out.index)], axis=1)
 
+    # A row is kept if any sample has abundance > 0 after blank subtraction.
+    # (NaNs — genuinely missing values — are treated as not-detected.)
+    blanksub = pd.DataFrame(corrected_frames, index=out.index)
+    info['passed_mask'] = (blanksub.fillna(0.0) > 0).any(axis=1)
+
     info['applied'] = True
     info['messages'].append(
         f'Applied blank correction to {len(sample_cols)} sample column(s) '
@@ -506,7 +533,7 @@ def apply_blank_correction(df, mode, x_mult, log):
 # the final DataFrame + a stats dict.
 # ---------------------------------------------------------------------------
 def run_pipeline(ei_matrix_src, ei_msp_src, pci_matrix_src, pci_msp_src,
-                 alkanes_df, log):
+                 alkanes_df, blank_mode, blank_x, log):
     log('Reading EI feature matrix...')
     ei_df = read_feature_matrix(ei_matrix_src)
     log(f'  EI table: {len(ei_df)} rows, {ei_df.shape[1]} cols')
@@ -525,15 +552,28 @@ def run_pipeline(ei_matrix_src, ei_msp_src, pci_matrix_src, pci_msp_src,
     log(f'  PCI table: {len(pci_df)} features, {n_pci_spec} spectra, '
         f'{ri_ok} within alkane bracket for RI')
 
+    # Blank correction runs BEFORE the molecular-ion search so the search can
+    # be restricted to features that survive it (abundance > 0 after blank
+    # subtraction). The corrected columns are appended to the EI table here and
+    # carried through to the final output.
+    log('Applying blank correction...')
+    ei_df, blank_info = apply_blank_correction(ei_df, blank_mode, blank_x, log)
+    keep_mask = blank_info['passed_mask']
+    if blank_info['applied']:
+        log(f'  Features kept after blank subtraction (abundance > 0): '
+            f'{int(keep_mask.sum())} / {len(keep_mask)}')
+
     log('Searching PCI for molecular-ion evidence...')
-    out_df, stats = find_molecular_ions(ei_df, pci_df)
+    out_df, stats = find_molecular_ions(ei_df, pci_df, consider_mask=keep_mask)
+    log(f'  Rows searched (after blank subtraction): '
+        f'{stats["rows_searched"]} / {stats["candidate_rows"]}')
     log(f'  Rows with evidence: {stats["rows_with_evidence"]} / {stats["candidate_rows"]}')
     log(f'  Features with at least one supported candidate: '
         f'{stats["features_with_evidence"]} / {stats["features_total"]}')
     log(f'  RT-fallback rows (EI RI was blank): {stats["rt_fallback_rows"]}')
     log(f'  Rows with a Notes entry: {stats["rows_with_notes"]}')
 
-    return out_df, stats
+    return out_df, stats, blank_info
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +675,12 @@ def build_candidate_figure(row):
 
 
 def render_visualization(df):
-    """Interactive candidate viewer for rows with molecular-ion evidence."""
+    """Interactive candidate viewer for rows with molecular-ion evidence.
+
+    Only features with abundance > 0 after blank subtraction are shown: the
+    molecular-ion search is gated on that condition (see run_pipeline), so
+    'Evidence of Molecular Ion' is only ever True for surviving features.
+    """
     mask = df['Evidence of Molecular Ion'].fillna(False).astype(bool)
     hits = df[mask].reset_index(drop=True)
 
@@ -814,17 +859,10 @@ if run_clicked:
 
     try:
         with st.spinner('Running pipeline...'):
-            out_df, stats = run_pipeline(
+            out_df, stats, blank_info = run_pipeline(
                 ei_matrix, ei_msp, pci_matrix, pci_msp,
-                alkanes_df, log,
+                alkanes_df, blank_mode, blank_x, log,
             )
-    except Exception as e:
-        st.exception(e)
-        st.stop()
-
-    # Blank correction (appends columns to the downloadable table)
-    try:
-        out_df, blank_info = apply_blank_correction(out_df, blank_mode, blank_x, log)
     except Exception as e:
         st.exception(e)
         st.stop()
